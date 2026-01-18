@@ -1,6 +1,8 @@
+import warnings
+warnings.filterwarnings('ignore')
+
 import os
 import random
-from sklearn.base import BaseEstimator
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,8 +12,8 @@ import joblib
 import dice_ml
 
 from catboost import CatBoostRegressor
-from sklearn.multioutput import MultiOutputRegressor
 
+# Constants
 OUTPUT_DIR = "outputs/"
 MODEL_DIR = os.path.join(OUTPUT_DIR, "models/")
 DATA_SPLITS = os.path.join(OUTPUT_DIR, "splits/")
@@ -21,14 +23,51 @@ DATA_FILE = "clean_data.csv"
 INPUT_PATH  = os.path.join(DATA_DIR, DATA_FILE)
 
 GLOBAL_SEED = 63
+categorical_features = ['Orientation', 'Glazing Area', 'Glazing Area Distribution']
+
+# Page configuration
+st.set_page_config(page_title="Energy Efficiency XAI Dashboard", layout="wide")
+
+# Custom CSS
+st.markdown("""
+    <style>
+    .main-header {
+        font-size: 2.5rem !important;
+        font-weight: bold;
+        color: #1f77b4;
+        margin-bottom: 1rem;
+    }
+    .sub-header {
+        font-size: 1.5rem !important;
+        color: #8dff55;
+        margin-top: 1rem !important;
+    }
+    .stButton>button {
+        width: 100%;
+        background-color: #1f77b4;
+        color: white;
+    }
+    div[data-baseweb="select"]>div {
+        cursor: pointer !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# Initialize session state
+if 'model' not in st.session_state:
+    st.session_state.model = None
+if 'X_train' not in st.session_state:
+    st.session_state.X_train = None
+if 'y_train' not in st.session_state:
+    st.session_state.y_train = None
+if 'explainer' not in st.session_state:
+    st.session_state.explainer = None
+if 'feature_names' not in st.session_state:
+    st.session_state.feature_names = None
 
 def set_global_seed():
     random.seed(GLOBAL_SEED)
     np.random.seed(GLOBAL_SEED)
-
-set_global_seed()
-
-st.set_page_config(page_title="Building Energy XAI Dashboard", layout="wide")
 
 @st.cache_data
 def load_data():
@@ -43,499 +82,486 @@ def load_data_splits():
     y_test = pd.read_csv(os.path.join(DATA_SPLITS, 'y_test.csv'))
     return X_train, X_test, y_train, y_test
 
-@st.cache_data
-def load_data_combined_loads():
-    X_train, X_test, y_train, y_test = load_data_splits()
-
-    y_train_combined = y_train.copy()
-    y_test_combined = y_test.copy()
-
-    y_train_combined['Combined Load'] = y_train_combined['Heating Load'] + y_train_combined['Cooling Load']
-    y_train_combined.drop('Heating Load', axis=1, inplace=True)
-    y_train_combined.drop('Cooling Load', axis=1, inplace=True)
-
-    y_test_combined['Combined Load'] = y_test_combined['Heating Load'] + y_test_combined['Cooling Load']
-    y_test_combined.drop('Heating Load', axis=1, inplace=True)
-    y_test_combined.drop('Cooling Load', axis=1, inplace=True)
-
-    return X_train, X_test, y_train_combined, y_test_combined
-
 @st.cache_resource
-def load_model():
+def load_model_and_explainer():
     model_study = joblib.load(os.path.join(MODEL_DIR, "catboost_regressor.joblib"))
     best_params = model_study.best_params_
-    best_params = {k.removeprefix("estimator__"): v for k, v in best_params.items()}
 
     best_model = CatBoostRegressor(**best_params, logging_level='Silent')
-    wrapped_model = MultiOutputRegressor(estimator=best_model)
 
-    X_train, X_test, y_train, y_test = load_data_splits()
-    wrapped_model.fit(X_train, y_train)
+    X_train, X_test, y_train, _ = load_data_splits()
+    best_model.fit(X_train, y_train)
 
-    return wrapped_model
+    explainer = shap.TreeExplainer(best_model)
 
-@st.cache_resource
-def load_combined_model():
-    # Load your trained model for combined loads
-    model_study = joblib.load(os.path.join(MODEL_DIR, "catboost_regressor.joblib"))
-    best_params = model_study.best_params_
-    best_params = {k.removeprefix("estimator__"): v for k, v in best_params.items()}
-    single_output_model = CatBoostRegressor(**best_params, logging_level='Silent')
+    return best_model, explainer, X_train, y_train
 
-    X_train, X_test, y_train, y_test = load_data_combined_loads()
-    single_output_model.fit(X_train, y_train)
+set_global_seed()
 
-    return single_output_model
+# Stakeholder - Question mapping
+STAKEHOLDER_QUESTION_MAPPING = {
+    "Building Owners": {
+        "questions": [
+            "Why is my building predicted to have this energy load?",
+            "What changes can reduce energy usage while keeping some features the same?",
+            "Is my building's energy performance typical for its design?"
+        ],
+        "explanation_type": ["local_shap", "counterfactual", "local_comparison"]
+    },
+    "Architects": {
+        "questions": [
+            "What design features generally impact energy requirements the most?",
+            "How does this feature tend to affect the total energy load?",
+            "What are the trade-offs between different design parameters?"
+        ],
+        "explanation_type": ["global_shap", "feature_dependence", "interaction"]
+    },
+    "Energy Consultants": {
+        "questions": [
+            "Which features are making this design efficient/inefficient?",
+            "What changes can improve the efficiency of this building?",
+            "What is the expected energy load for this configuration?"
+        ],
+        "explanation_type": ["local_shap", "counterfactual", "prediction"]
+    },
+    "Regulators": {
+        "questions": [
+            "Are the model decisions consistent and reliable?",
+            "What factors dominate energy efficiency predictions overall?",
+            "How do predictions vary across different building types?"
+        ],
+        "explanation_type": ["model_performance", "global_shap", "distribution"]
+    }
+}
 
-class MultiTargetWrapper(BaseEstimator):
-    def __init__(self, model, heating_max, cooling_max):
-        self.model = model
-        self.y1_max = heating_max 
-        self.y2_max = cooling_max
-
-    def predict(self, X):
-        preds = self.model.predict(X)
-        y1 = preds[:, 0]
-        y2 = preds[:, 1]
-        
-        y1_norm = y1 / self.y1_max
-        y2_norm = y2 / self.y2_max
-        
-        composite_score = (y1_norm + y2_norm) / 2
-        
-        return composite_score
-
-st.title("Building Energy Efficiency - XAI Dashboard")
-st.markdown("""
-This dashboard helps architects, end users, and regulators understand and optimize building energy consumption
-using explainable AI techniques.
-""")
-
-st.sidebar.header("Select Your Role")
-role = st.sidebar.selectbox(
-    "I am a(an)...",
-    ["Architect", "Building Owner", "Regulator"]
-)
-
-st.sidebar.markdown(f"**Dashboard customized for: {role}**")
-
-# Main content - Tabs
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Building Energy Predictor", 
-    "Feature Importance (SHAP)", 
-    "What-If Analysis (Counterfactuals)",
-    "Portfolio Analysis"
-])
-
-# ============ TAB 1: BUILDING ENERGY PREDICTOR ============
-with tab1:
-    st.header("Building Energy Predictor")
+def plot_local_shap(model, explainer, X_train, instance, feature_names):
+    shap_values = explainer.shap_values(instance)
     
-    col1, col2 = st.columns(2)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    shap.plots.waterfall(
+        shap.Explanation(
+            values=shap_values[0],
+            base_values=explainer.expected_value,
+            data=instance.values[0],
+            feature_names=feature_names
+        ),
+        show=False
+    )
+    st.pyplot(fig)
+    plt.close()
 
-    with col1:
-        st.subheader("Building Specifications")
+def plot_global_shap(explainer, X_train, feature_names):
+    shap_values = explainer.shap_values(X_train)
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    shap.summary_plot(shap_values, X_train, feature_names=feature_names, show=False)
+    st.pyplot(fig)
+    plt.close()
 
-        roof_area = st.slider("Roof Area", 100, 250, 150, 10)
-        surface_area = st.slider("Surface Area", 500, 850, 650, 10)
-        wall_area = st.slider("Wall Area", 200, 420, 300, 10)
-        glazing_area = st.select_slider("Glazing Area Ratio", 
-                                         options=[0.0, 0.1, 0.25, 0.4], 
-                                         value=0.25)
-        glazing_area_distribution = st.selectbox("Glazing Area Distribution", 
-                                                 options=[0, 1, 2, 3, 4],
-                                                 index=2)
-        
-        # Predict button
-        if st.button("Predict Energy Consumption", type="primary"):
-            model = load_model()
-            input_data = pd.DataFrame({
-                'Roof Area': [roof_area],
-                'Surface Area': [surface_area],
-                'Wall Area': [wall_area],
-                'Glazing Area': [glazing_area],
-                'Glazing Area Distribution': [glazing_area_distribution]
-            })
-            prediction = model.predict(input_data)
-            heating_load, cooling_load = prediction[0]
-            st.success(f"Predicted Heating Load: {heating_load:.2f}")
-            st.success(f"Predicted Cooling Load: {cooling_load:.2f}")
+def plot_feature_dependence(explainer, X_train, feature_names, feature):
+    shap_values = explainer(X_train)
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    shap.plots.scatter(shap_values[:, feature], color=shap_values, show=False)
+    fig = plt.gcf() 
+    st.pyplot(fig)
+    plt.close(fig)
 
-            # Store in session state
-            st.session_state['current_prediction'] = prediction
-            st.session_state['current_input'] = input_data
+def generate_counterfactual_owners(model, instance, feature_names, features_to_fix, desired_range, X_train):
+    current_prediction = model.predict(instance)[0]
+    
+    st.write(f"**Current Prediction:** {current_prediction:.2f} kWh")
+    st.write(f"**Desired Range:** {desired_range[0]:.2f} - {desired_range[1]:.2f} kWh")
+    
+    counterfactuals = []
+    
+    for feature_idx, feature in enumerate(feature_names):
+        if feature in features_to_fix:
+            continue
 
-    with col2:
-        st.subheader("Energy Prediction Results")
+        if feature in categorical_features:
+            # Only consider the neighboring categories for categorical features
+            unique_values = sorted(X_train[feature].unique())
+            current_value = instance.iloc[0, feature_idx]
+            current_index = unique_values.index(current_value)
 
-        if 'current_prediction' in st.session_state:
-            pred = st.session_state['current_prediction']
-            total_energy = pred[0][0] + pred[0][1]
+            neighbor_indices = []
+            if current_index == 0:
+                neighbor_indices.append(1)
+            elif current_index == len(unique_values) - 1:
+                neighbor_indices.append(len(unique_values) - 2)
+            else:
+                neighbor_indices.extend([current_index - 1, current_index + 1])
+
+            for idx in neighbor_indices:
+                cf_instance = instance.copy()
+                cf_instance.iloc[0, feature_idx] = unique_values[idx]
+                
+                cf_prediction = model.predict(cf_instance)[0]
+                
+                if desired_range[0] <= cf_prediction <= desired_range[1]:
+                    counterfactuals.append({
+                        'Feature': feature,
+                        'Original': instance.iloc[0, feature_idx],
+                        'Modified': unique_values[idx],
+                        'Change (%)': 'N/A',
+                        'New Prediction': cf_prediction
+                    })
+            continue
             
-            # Display results with metrics
-            col_a, col_b, col_c = st.columns(3)
-
-            with col_a:
-                st.metric("Heating Load", f"{pred[0][0]:.2f}", delta=None)
-
-            with col_b:
-                st.metric("Cooling Load", f"{pred[0][1]:.2f}", delta=None)
-
-            with col_c:
-                st.metric("Total Load", f"{(pred[0][0] + pred[0][1]):.2f}", delta=None)
-
-            # Benchmark comparison
-            st.subheader("Benchmark Comparison")
-            df = load_data()
-            avg_total = df[['Heating Load', 'Cooling Load']].sum(axis=1).mean()
-
-            fig, ax = plt.subplots(figsize=(8, 4))
-            categories = ['Your Building', 'Average Building']
-            values = [total_energy, avg_total]
-
-            ax.barh(categories, values, color=['skyblue', 'lightgreen'])
-            ax.set_xlabel("Total Energy Load")
-            ax.set_title("Energy Performance Comparison")
-            st.pyplot(fig)
-        else:
-            st.info("Please input building specifications and click 'Predict Energy Consumption' to see results.")
-
-# ============ TAB 2: SHAP ANALYSIS ============
-with tab2:
-    st.header("Feature Importance Analysis (SHAP)")
-    # Role-specific guidance
-    if role == "Architect":
-        st.info("**For Architects**: This shows which design features have the biggest impact on energy consumption. Use this to prioritize design decisions.")
-    elif role == "Building Owner":
-        st.info("**For Building Owners**: This shows why your building's energy consumption is what it is, helping you understand potential savings opportunities.")
-    elif role == "Regulator":
-        st.info("**For Regulators**: This analysis helps identify key factors influencing building energy use across portfolios, guiding policy decisions.")
-
-    # Load model and compute SHAP
-    if st.button("Generate Feature Importance Explanations"):
-        with st.spinner("Computing SHAP values..."):
-            model = load_model()
-            df = load_data()
-            X = df.iloc[:, :-2]
-
-            heating_model = model.estimators_[0]
-            cooling_model = model.estimators_[1]
-
-            heating_explainer = shap.TreeExplainer(heating_model)
-            cooling_explainer = shap.TreeExplainer(cooling_model)
-
-            heating_shap_values = heating_explainer.shap_values(X)
-            cooling_shap_values = cooling_explainer.shap_values(X)
-
-            # Store in session state
-            st.session_state['heating_shap_values'] = heating_shap_values
-            st.session_state['cooling_shap_values'] = cooling_shap_values
-            st.session_state['shap_data'] = X
-
-    if 'heating_shap_values' in st.session_state:
-        heating_shap_values = st.session_state['heating_shap_values']
-        cooling_shap_values = st.session_state['cooling_shap_values']
-        X_shap = st.session_state['shap_data']
-
-        # Choose output
-        output_choice = st.radio("Analyze:", ["Heating Load", "Cooling Load"])
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.subheader("Global Feature Importance")
-
-            if output_choice == "Heating Load":
-                fig, ax = plt.subplots(figsize=(8, 6))
-                shap.summary_plot(heating_shap_values, X_shap, plot_type="bar", show=False)
-                st.pyplot(fig)
-                plt.clf()
-            elif output_choice == "Cooling Load":
-                fig, ax = plt.subplots(figsize=(8, 6))
-                shap.summary_plot(cooling_shap_values, X_shap, plot_type="bar", show=False)
-                st.pyplot(fig)
-                plt.clf()
-        
-        with col2:
-            st.subheader("Feature Impact Distribution")
-
-            if output_choice == "Heating Load":
-                fig, ax = plt.subplots(figsize=(8, 6))
-                shap.summary_plot(heating_shap_values, X_shap, show=False)
-                st.pyplot(fig)
-                plt.clf()
-            elif output_choice == "Cooling Load":
-                fig, ax = plt.subplots(figsize=(8, 6))
-                shap.summary_plot(cooling_shap_values, X_shap, show=False)
-                st.pyplot(fig)
-                plt.clf()
-
-        # Local explanation for current building
-        if 'current_input' in st.session_state:
-            st.subheader("Your Building's Explanation")
-
-            # Choose output
-            output_choice_local = st.radio("Explain for:", ["Heating Load", "Cooling Load", "Both"], key="local_explain_choice")
-
-            X_current = st.session_state['current_input']
-            model = load_model()
-
-            heating_model = model.estimators_[0]
-            cooling_model = model.estimators_[1]
-
-            heating_explainer = shap.TreeExplainer(heating_model)
-            cooling_explainer = shap.TreeExplainer(cooling_model)
-
-            heating_shap_current = heating_explainer.shap_values(X_current)
-            cooling_shap_current = cooling_explainer.shap_values(X_current)
-
-            if output_choice_local == "Heating Load":
-                st.subheader("Heating Load Explanation")
-                fig, ax = plt.subplots(figsize=(8, 6))
-                shap.plots.waterfall(shap.Explanation(values=heating_shap_current[0],
-                                                      base_values=heating_explainer.expected_value,
-                                                      data=X_current.iloc[0]), show=False)
-                st.pyplot(fig)
-                plt.clf()
+        for delta in [-0.2, -0.1, 0.1, 0.2]:
+            cf_instance = instance.copy()
+            cf_instance.iloc[0, feature_idx] *= (1 + delta)
             
-            elif output_choice_local == "Cooling Load":
-                st.subheader("Cooling Load Explanation")
-                fig, ax = plt.subplots(figsize=(8, 6))
-                shap.plots.waterfall(shap.Explanation(values=cooling_shap_current[0],
-                                                      base_values=cooling_explainer.expected_value,
-                                                      data=X_current.iloc[0]), show=False)
-                st.pyplot(fig)
-                plt.clf()
+            cf_prediction = model.predict(cf_instance)[0]
             
-            elif output_choice_local == "Both":
-                # Show two waterfall plots side by side
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    st.subheader("Heating Load Explanation")
-                    fig, ax = plt.subplots(figsize=(8, 6))
-                    shap.plots.waterfall(shap.Explanation(values=heating_shap_current[0],
-                                                        base_values=heating_explainer.expected_value,
-                                                        data=X_current.iloc[0]), show=False)
-                    st.pyplot(fig)
-                    plt.clf()
-
-                with col2:
-                    st.subheader("Cooling Load Explanation")
-                    fig, ax = plt.subplots(figsize=(8, 6))
-                    shap.plots.waterfall(shap.Explanation(values=cooling_shap_current[0],
-                                                        base_values=cooling_explainer.expected_value,
-                                                        data=X_current.iloc[0]), show=False)
-                    st.pyplot(fig)
-                    plt.clf()
-
-# ============ TAB 3: COUNTERFACTUAL ANALYSIS ============
-with tab3:
-    st.header("What-If Analysis: Counterfactual Scenarios")
-
-    if role == "Architect":
-        st.info("**For Architects**: Explore how changing design features can impact energy consumption. Use this to optimize your designs for better efficiency.")
-
-    if 'current_prediction' not in st.session_state:
-        st.warning("Please make a prediction in the 'Building Predictor' tab first.")
+            if desired_range[0] <= cf_prediction <= desired_range[1]:
+                change_pct = delta * 100
+                counterfactuals.append({
+                    'Feature': feature,
+                    'Original': instance.iloc[0, feature_idx],
+                    'Modified': cf_instance.iloc[0, feature_idx],
+                    'Change (%)': change_pct,
+                    'New Prediction': cf_prediction
+                })
+    
+    if counterfactuals:
+        cf_df = pd.DataFrame(counterfactuals)
+        cf_df = cf_df.sort_values('Change (%)',
+            key=lambda x: pd.to_numeric(x, errors='coerce').abs(),
+            na_position='last'
+        )
+        st.write("**Possible Counterfactual Changes:**")
+        st.dataframe(cf_df, use_container_width=True)
     else:
-        current_total = st.session_state['current_prediction'].sum()
+        st.warning("No simple counterfactuals found. Try adjusting the desired range.")
 
-        # Input target variable - Total Load or separate Heating/Cooling
-        target_type = st.radio("Optimize for:", ["Total Load", "Heating Load and Cooling Load"])
+def generate_counterfactuals(model, X_train, y_train, instance, desired_range):
+    combined_df = pd.concat([X_train, y_train], axis=1)
 
-        if target_type == "Total Load":
-            st.subheader("Set Energy Reduction Target")
+    dice_data = dice_ml.Data(
+        dataframe=combined_df,
+        continuous_features=X_train.columns.tolist(),
+        outcome_name='Combined Load'
+    )
 
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-                st.metric("Current Total Energy", f"{current_total:.2f}")
-
-            with col2:
-                reduction_pct = st.slider("Target Reduction %", 0, 50, 20, 5)
-                target_energy = current_total * (1 - reduction_pct/100)
-                st.metric("Target Total Energy", f"{target_energy:.2f}")
-
-            with col3:
-                st.metric("Required Reduction", f"{current_total - target_energy:.2f}")
-
-            # Generate counterfactuals button
-            if st.button("Generate Counterfactual Scenarios"):
-                with st.spinner("Finding optimal design changes..."):
-                    # Load data and model
-                    X_train, X_test, y_train, y_test = load_data_combined_loads()
-                    model = load_combined_model()
-
-                    # Create DiCE data and model objects
-                    combined_df = pd.concat([X_train, y_train], axis=1)
-
-                    dice_data = dice_ml.Data(
-                        dataframe=combined_df,
-                        continuous_features=X_train.columns.tolist(),
-                        outcome_name='Combined Load'
-                    )
-
-                    dice_model = dice_ml.Model(model=model, backend='sklearn', model_type='regressor')
-                    dice_explainer = dice_ml.Dice(data_interface=dice_data, model_interface=dice_model, method='random')
-
-                    # Current input
-                    X_current = st.session_state['current_input']
-                    
-                    query_instance = X_current.iloc[0:1]
-
-                    # Generate counterfactuals
-                    counterfactual = dice_explainer.generate_counterfactuals(
-                        query_instance,
-                        total_CFs=3,
-                        desired_range=[0, target_energy]
-                    )
-
-                    st.subheader("Counterfactual Scenarios")
-                    cf_df = counterfactual.cf_examples_list[0].final_cfs_df
-                    st.dataframe(cf_df)
-        
-        elif target_type == "Heating Load and Cooling Load":
-            current_heating_load = st.session_state['current_prediction'][0][0]
-            current_cooling_load = st.session_state['current_prediction'][0][1]
-
-            X_train, X_test, y_train, y_test = load_data_splits()
-
-            st.subheader("Set Energy Reduction Target")
-
-            col1, col2, col3, col4 = st.columns(4)
-
-            with col1:
-                st.metric("Current Heating Load", f"{current_heating_load:.2f}")
-                st.metric("Current Cooling Load", f"{current_cooling_load:.2f}")
-
-            with col2:
-                st.metric("Max Known Heating Load", f"{y_train.iloc[:, 0].max() :.2f}")
-                st.metric("Max Known Cooling Load", f"{y_train.iloc[:, 1].max() :.2f}")
-
-            with col3:
-                percentage_of_max = st.slider("Target % of Max Known Loads", 0, 100, 80, 5)
-                target_heating = y_train.iloc[:, 0].max() * (percentage_of_max / 100)
-                target_cooling = y_train.iloc[:, 1].max() * (percentage_of_max / 100)
-
-            with col4:
-                st.metric("Target Heating Load", f"{target_heating:.2f}")
-                st.metric("Target Cooling Load", f"{target_cooling:.2f}")
-
-            # Generate counterfactuals button
-            if st.button("Generate Counterfactual Scenarios"):
-                with st.spinner("Finding optimal design changes..."):
-                    model = load_model()
-
-                    multi_object_counterfactual_wrapper = MultiTargetWrapper(
-                        model=model,
-                        heating_max=y_train.iloc[:, 0].max(),
-                        cooling_max=y_train.iloc[:, 1].max()
-                    )
-
-                    multi_object_dice_data = dice_ml.Data(dataframe=X_train.assign(Composite_Score=0),
-                    continuous_features=X_train.columns.tolist(),
-                    outcome_name='Composite_Score')
-
-                    multi_object_dice_model = dice_ml.Model(model=multi_object_counterfactual_wrapper, backend="sklearn", model_type='regressor')
-                    multi_object_dice_explainer = dice_ml.Dice(multi_object_dice_data, multi_object_dice_model, method="random")
-
-                    # Current input
-                    X_current = st.session_state['current_input']
-                    query_instance = X_current.iloc[0:1]
-
-                    desired_range = [0, percentage_of_max / 100]
-
-                    multi_target_counterfactuals = multi_object_dice_explainer.generate_counterfactuals(
-                        query_instance, 
-                        total_CFs=3, 
-                        desired_range=desired_range
-                    )
-
-                    # Decompose counterfactuals back to Heating and Cooling Loads
-                    cf_df = multi_target_counterfactuals.cf_examples_list[0].final_cfs_df.drop('Composite_Score', axis=1)
-
-                    predictions = model.predict(cf_df)
-                    cf_df['Predicted Heating Load'] = predictions[:, 0]
-                    cf_df['Predicted Cooling Load'] = predictions[:, 1]
-
-                    # Display counterfactuals
-                    st.subheader("Counterfactual Scenarios")
-                    st.dataframe(cf_df)
-
-# ============ TAB 4: PORTFOLIO ANALYSIS ============
-with tab4:
-    st.header("Building Portfolio Analysis")
-
-    if role == "Regulator":
-        st.info("**For Regulators**: Analyze energy performance across a portfolio of buildings to identify trends and set efficiency standards.")
-
-    df = load_data()
+    dice_model = dice_ml.Model(model=model, backend='sklearn', model_type='regressor')
+    dice_explainer = dice_ml.Dice(data_interface=dice_data, model_interface=dice_model, method='random')
     
-    # Summary statistics
-    col1, col2, col3, col4 = st.columns(4)
+    query_instance = instance.iloc[0:1]
+
+    # Generate counterfactuals
+    counterfactual = dice_explainer.generate_counterfactuals(
+        query_instance,
+        total_CFs=5,
+        desired_range=desired_range
+    )
+
+    if counterfactual:
+        cf_df = counterfactual.cf_examples_list[0].final_cfs_df
+        st.write("**Possible Counterfactual Changes:**")
+        st.dataframe(cf_df, use_container_width=True)
+    else:
+        st.warning("No counterfactuals found for this range.")
+
+def main():
+    st.markdown('<p class="main-header">Energy Efficiency - XAI Dashboard</p>', unsafe_allow_html=True)
+    st.markdown("""
+    This dashboard helps architects, owners, energy consultants, and regulators understand and optimize building energy consumption
+    using explainable AI techniques.
+    """)
+
+    # Load data
+    df = load_data()
+    X = df.drop('Combined Load', axis=1)
+    y = df['Combined Load']
+    feature_names = X.columns.tolist()
+
+    # Train model
+    if st.session_state.model is None:
+        with st.spinner("Training model..."):
+            model, explainer, X_train, y_train = load_model_and_explainer()
+            st.session_state.model = model
+            st.session_state.explainer = explainer
+            st.session_state.X_train = X_train
+            st.session_state.y_train = y_train
+            st.session_state.feature_names = feature_names
+
+    model = st.session_state.model
+    explainer = st.session_state.explainer
+    X_train = st.session_state.X_train
+    y_train = st.session_state.y_train
+
+    st.success("Model loaded and ready!")
+    st.markdown("---")
+
+    # Stakeholder selection
+    col1, col2 = st.columns([1, 3])
 
     with col1:
-        st.metric("Total Buildings", f"{df.shape[0]}")
+        st.markdown('<p class="sub-header">Select Role</p>', unsafe_allow_html=True)
+        selected_role = st.radio(
+            "Stakeholder",
+            options=list(STAKEHOLDER_QUESTION_MAPPING.keys()),
+            label_visibility="collapsed"
+        )
 
     with col2:
-        avg_heating = df['Heating Load'].mean()
-        st.metric("Avg Heating Load", f"{avg_heating:.2f}")
-    
-    with col3:
-        avg_cooling = df['Cooling Load'].mean()
-        st.metric("Avg Cooling Load", f"{avg_cooling:.2f}")
+        st.markdown(f'<p class="sub-header">{selected_role}</p>', unsafe_allow_html=True)
 
-    with col4:
-        avg_total = (df['Heating Load'] + df['Cooling Load']).mean()
-        st.metric("Avg Total Load", f"{avg_total:.2f}")
+        questions = STAKEHOLDER_QUESTION_MAPPING[selected_role]['questions']
+        selected_question = st.selectbox("Select your question:", questions)
 
-    # Distribution plots
-    st.subheader("Energy Distribution Analysis")
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        question_idx = questions.index(selected_question)
+        explanation_type = STAKEHOLDER_QUESTION_MAPPING[selected_role]["explanation_type"][question_idx]
+        st.markdown("---")
 
-    axes[0].hist(df['Heating Load'], bins=20, color='skyblue', edgecolor='black')
-    axes[0].set_title("Heating Load Distribution")
-    axes[0].set_xlabel("Heating Load")
-    axes[0].set_ylabel("Frequency")
+        # Create layout for inputs and visualization
+        needs_local = explanation_type in ["local_shap", "counterfactual", "local_comparison", "prediction"]
+        needs_counterfactual = explanation_type == "counterfactual"
+        
+        if needs_local or needs_counterfactual:
+            input_col, viz_col = st.columns([1, 2])
+        else:
+            viz_col = st.container()
+            input_col = None
 
-    axes[1].hist(df['Cooling Load'], bins=20, color='lightgreen', edgecolor='black')
-    axes[1].set_title("Cooling Load Distribution")
-    axes[1].set_xlabel("Cooling Load")
-    axes[1].set_ylabel("Frequency")
+        # Input section
+        instance_data = {}
+        features_to_fix = None
+        desired_range = None
 
-    total_load = df['Heating Load'] + df['Cooling Load']
-    axes[2].hist(total_load, bins=20, color='salmon', edgecolor='black')
-    axes[2].set_title("Total Load Distribution")
-    axes[2].set_xlabel("Total Load")
-    axes[2].set_ylabel("Frequency")
+        if needs_local and input_col:
+            with input_col:
+                st.markdown("### Building Specifications")
 
-    st.pyplot(fig)
+                for feature in feature_names:
+                    if feature in categorical_features:
+                        options = sorted(X[feature].unique())
+                        default_option = options[1] if len(options) > 1 else options[0]
+                        instance_data[feature] = st.selectbox(
+                            feature.replace('_', ' '),
+                            options=options,
+                            index=options.index(default_option)
+                        )
+                        continue
 
-    # Feature correlation with energy
-    st.subheader("Feature Impact Across Portfolio")
+                    min_val = float(X[feature].min())
+                    max_val = float(X[feature].max())
+                    default_val = float(X[feature].median())
 
-    feature_choice = st.selectbox("Select Feature to Analyze", 
-                                  df.columns[:-2].tolist())
-    
-    fig, ax = plt.subplots(figsize=(8, 6))
+                    instance_data[feature] = st.slider(
+                        feature.replace('_', ' '),
+                        min_value=min_val,
+                        max_value=max_val,
+                        value=default_val,
+                        step=(max_val - min_val) / 100
+                    )
 
-    ax.scatter(df[feature_choice], df['Heating Load'] + df['Cooling Load'], alpha=0.6)
-    ax.set_xlabel(feature_choice)
-    ax.set_ylabel("Total Energy Load")
-    ax.set_title(f"{feature_choice} vs Total Energy Load")
-    
-    # Add trend line
-    z = np.polyfit(df[feature_choice], df['Heating Load'] + df['Cooling Load'], 1)
-    p = np.poly1d(z)
-    ax.plot(df[feature_choice], p(df[feature_choice]), "r--")
+        # Visualization section
+        with viz_col:
+            st.markdown("### Explanation")
+            
+            if explanation_type == "local_shap":
+                instance = pd.DataFrame([instance_data])
+                prediction = model.predict(instance)[0]
+                st.metric("Predicted Energy Load", f"{prediction:.2f} kWh")
+                plot_local_shap(model, explainer, X_train, instance, feature_names)
+                
+                st.info("**Interpretation:** Red bars push the prediction higher, blue bars push it lower. Longer bars indicate stronger effects.")
 
-    st.pyplot(fig)
+            elif explanation_type == "global_shap":
+                shap_values = explainer.shap_values(X_train)
+                
+                fig, ax = plt.subplots(figsize=(10, 8))
+                # shap.summary_plot(shap_values, X_train, feature_names=feature_names, plot_type="bar", show=False)
+                shap.plots.bar(shap.Explanation(
+                    values=shap_values,
+                    base_values=explainer.expected_value,
+                    data=X_train,
+                    feature_names=feature_names
+                ), show=False)
 
-# Footer
-st.markdown("---")
-st.sidebar.markdown("""
-- [Data Source: UCI Machine Learning Repository - Energy Efficiency Data Set](https://archive.ics.uci.edu/dataset/242/energy+efficiency)
-""")
-st.sidebar.markdown("---")
-st.sidebar.info("This is a prototype dashboard for demonstration purposes.")
+                st.pyplot(fig)
+                plt.close()
+                
+                st.info("**Interpretation:** This shows the impact of each feature on model predictions across all samples.")
+                
+            elif explanation_type == "feature_dependence":
+                feature_of_interest = st.selectbox(
+                    "Select feature to analyze:",
+                    options=feature_names,
+                    index=feature_names.index("Glazing Area") if "Glazing Area" in feature_names else 0
+                )
+
+                plot_feature_dependence(explainer, X_train, feature_names, feature_of_interest)
+                st.info(f"**Interpretation:** Shows how {feature_of_interest} affects energy load predictions. Color indicates interaction with other features.")
+
+            elif explanation_type == "counterfactual":
+                st.markdown("### Counterfactual Settings")
+                    
+                if selected_role == "Building Owners":
+                    features_to_fix = st.multiselect(
+                        "Keep these features unchanged:",
+                        options=feature_names,
+                        default=[]
+                    )
+                
+                current_pred = model.predict(pd.DataFrame([instance_data]))[0]
+                
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    min_desired = st.number_input(
+                        "Min desired load:",
+                        value=max(0.0, current_pred - 10),
+                        step=1.0
+                    )
+                with col_b:
+                    max_desired = st.number_input(
+                        "Max desired load:",
+                        value=current_pred - 5,
+                        step=1.0
+                    )
+                desired_range = (min_desired, max_desired)
+
+                instance = pd.DataFrame([instance_data])
+                if selected_role == "Building Owners":
+                    generate_counterfactual_owners(model, instance, feature_names, features_to_fix, desired_range, X_train)
+                else:
+                    generate_counterfactuals(model, X_train, y_train, instance, desired_range)
+            
+            elif explanation_type == "model_performance":
+                shap_values = explainer.shap_values(X_train)
+                
+                # Global feature importance
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+                
+                feature_importance = np.abs(shap_values).mean(axis=0)
+                sorted_idx = np.argsort(feature_importance)
+                
+                ax1.barh(range(len(sorted_idx)), feature_importance[sorted_idx])
+                ax1.set_yticks(range(len(sorted_idx)))
+                ax1.set_yticklabels([feature_names[i] for i in sorted_idx])
+                ax1.set_xlabel('Mean |SHAP value|')
+                ax1.set_title('Global Feature Importance')
+                
+                # Prediction distribution
+                predictions = model.predict(X_train)
+                ax2.hist(predictions, bins=30, edgecolor='black', alpha=0.7)
+                ax2.set_xlabel('Predicted Energy Load (kWh)')
+                ax2.set_ylabel('Frequency')
+                ax2.set_title('Prediction Distribution')
+                
+                st.pyplot(fig)
+                plt.close()
+                
+                st.info("**Interpretation:** Left plot shows which features are most important globally. Right plot shows the distribution of model predictions.")
+
+            elif explanation_type == "interaction":
+                plot_global_shap(explainer, X_train, feature_names)
+                st.info("**Interpretation:** Shows how the increase and decrease of features affect the total energy load.")
+            
+            elif explanation_type == "local_comparison":
+                features_to_fix_for_comparison = st.multiselect(
+                    "Buildings with similar:",
+                    options=feature_names,
+                    default=feature_names[:2]
+                )
+
+                instance = pd.DataFrame([instance_data])
+                prediction = model.predict(instance)[0]
+
+                print(type(X_train))
+                print(type(instance_data))
+                
+                eps = 1e-8
+
+                instance_subset = pd.Series(
+                    {f: instance_data[f] for f in features_to_fix_for_comparison}
+                )
+
+                X_subset = X_train[features_to_fix_for_comparison]
+
+                relative_diff = np.abs(X_subset - instance_subset) / (
+                    np.abs(instance_subset) + eps
+                )
+
+                similar_mask = (relative_diff <= 0.10).all(axis=1)
+
+                similar_predictions = (
+                    model.predict(X_train.loc[similar_mask])
+                    if similar_mask.any()
+                    else []
+                )
+                
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    st.metric("Your Building", f"{prediction:.2f} kWh")
+                with col_b:
+                    if len(similar_predictions) > 0:
+                        st.metric("Similar Buildings (Avg)", f"{similar_predictions.mean():.2f} kWh")
+                with col_c:
+                    st.metric("Dataset Average", f"{model.predict(X_train).mean():.2f} kWh")
+                
+                plot_local_shap(model, explainer, X_train, instance, feature_names)
+            
+            elif explanation_type == "distribution":
+                predictions = model.predict(X_train)
+
+                feature_to_plot = st.selectbox(
+                    "Select feature to segment by:",
+                    options=feature_names,
+                    index=feature_names.index("Overall Height") if "Overall Height" in feature_names else 0
+                )
+                
+                fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+                
+                # Overall distribution
+                axes[0, 0].hist(predictions, bins=30, edgecolor='black', alpha=0.7)
+                axes[0, 0].set_xlabel('Energy Load (kWh)')
+                axes[0, 0].set_ylabel('Frequency')
+                axes[0, 0].set_title('Overall Prediction Distribution')
+
+                # By selected feature
+                for value in sorted(X_train[feature_to_plot].unique()):
+                    mask = X_train[feature_to_plot] == value
+                    axes[0, 1].hist(predictions[mask], alpha=0.5, label=f'{feature_to_plot}={value}', bins=20)
+
+                axes[0, 1].set_xlabel('Energy Load (kWh)')
+                axes[0, 1].set_ylabel('Frequency')
+                axes[0, 1].set_title(f'Distribution by {feature_to_plot}')
+                axes[0, 1].legend()
+                
+                # Scatter: Actual features vs prediction
+                axes[1, 0].scatter(X_train[feature_to_plot], predictions, alpha=0.5)
+                axes[1, 0].set_xlabel(f'{feature_to_plot}')
+                axes[1, 0].set_ylabel('Predicted Energy Load (kWh)')
+                axes[1, 0].set_title(f'{feature_to_plot} vs Energy Load')
+
+                axes[1, 1].axis('off')  # Empty plot
+                
+                plt.tight_layout()
+                st.pyplot(fig)
+                plt.close()
+                
+                st.info("**Interpretation:** These plots show how predictions vary across a building characteristic.")
+            
+            elif explanation_type == "prediction":
+                instance = pd.DataFrame([instance_data])
+                prediction = model.predict(instance)[0]
+                
+                st.metric("Predicted Energy Load", f"{prediction:.2f} kWh")
+                
+                # Show feature contributions
+                plot_local_shap(model, explainer, X_train, instance, feature_names)
+
+    # Footer
+    st.markdown("---")
+    st.sidebar.markdown("""
+    - [Data Source: UCI Machine Learning Repository - Energy Efficiency Data Set](https://archive.ics.uci.edu/dataset/242/energy+efficiency)
+    """)
+    st.sidebar.markdown("---")
+    st.sidebar.info("This is a prototype dashboard for demonstration purposes.")
+
+if __name__ == "__main__":
+    main()
