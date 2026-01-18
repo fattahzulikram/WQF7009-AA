@@ -103,7 +103,7 @@ STAKEHOLDER_QUESTION_MAPPING = {
     "Building Owners": {
         "questions": [
             "Why is my building predicted to have this energy load?",
-            "What changes can reduce energy usage while keeping some features the same?",
+            "What small changes can reduce energy usage while keeping some features the same?",
             "Is my building's energy performance typical for its design?"
         ],
         "explanation_type": ["local_shap", "counterfactual", "local_comparison"]
@@ -170,8 +170,8 @@ def plot_feature_dependence(explainer, X_train, feature_names, feature):
 def generate_counterfactual_owners(model, instance, feature_names, features_to_fix, desired_range, X_train):
     current_prediction = model.predict(instance)[0]
     
-    st.write(f"**Current Prediction:** {current_prediction:.2f} kWh")
-    st.write(f"**Desired Range:** {desired_range[0]:.2f} - {desired_range[1]:.2f} kWh")
+    st.write(f"**Current Prediction:** {current_prediction:.2f} units")
+    st.write(f"**Desired Range:** {desired_range[0]:.2f} - {desired_range[1]:.2f} units")
     
     counterfactuals = []
     
@@ -230,7 +230,8 @@ def generate_counterfactual_owners(model, instance, feature_names, features_to_f
         cf_df = cf_df.sort_values('Change (%)',
             key=lambda x: pd.to_numeric(x, errors='coerce').abs(),
             na_position='last'
-        )
+        ).reset_index(drop=True)
+        cf_df.index += 1
         st.write("**Possible Counterfactual Changes:**")
         st.dataframe(cf_df, use_container_width=True)
     else:
@@ -259,6 +260,7 @@ def generate_counterfactuals(model, X_train, y_train, instance, desired_range):
 
     if counterfactual:
         cf_df = counterfactual.cf_examples_list[0].final_cfs_df
+        cf_df.index += 1
         st.write("**Possible Counterfactual Changes:**")
         st.dataframe(cf_df, use_container_width=True)
     else:
@@ -365,7 +367,7 @@ def main():
             if explanation_type == "local_shap":
                 instance = pd.DataFrame([instance_data])
                 prediction = model.predict(instance)[0]
-                st.metric("Predicted Energy Load", f"{prediction:.2f} kWh")
+                st.metric("Predicted Energy Load", f"{prediction:.2f} units")
                 plot_local_shap(model, explainer, X_train, instance, feature_names)
                 
                 st.info("**Interpretation:** Red bars push the prediction higher, blue bars push it lower. Longer bars indicate stronger effects.")
@@ -391,7 +393,7 @@ def main():
                 feature_of_interest = st.selectbox(
                     "Select feature to analyze:",
                     options=feature_names,
-                    index=feature_names.index("Glazing Area") if "Glazing Area" in feature_names else 0
+                    index=feature_names.index("Orientation") if "Orientation" in feature_names else 0
                 )
 
                 plot_feature_dependence(explainer, X_train, feature_names, feature_of_interest)
@@ -448,7 +450,7 @@ def main():
                 # Prediction distribution
                 predictions = model.predict(X_train)
                 ax2.hist(predictions, bins=30, edgecolor='black', alpha=0.7)
-                ax2.set_xlabel('Predicted Energy Load (kWh)')
+                ax2.set_xlabel('Predicted Energy Load (units)')
                 ax2.set_ylabel('Frequency')
                 ax2.set_title('Prediction Distribution')
                 
@@ -496,12 +498,12 @@ def main():
                 
                 col_a, col_b, col_c = st.columns(3)
                 with col_a:
-                    st.metric("Your Building", f"{prediction:.2f} kWh")
+                    st.metric("Your Building", f"{prediction:.2f} units")
                 with col_b:
                     if len(similar_predictions) > 0:
-                        st.metric("Similar Buildings (Avg)", f"{similar_predictions.mean():.2f} kWh")
+                        st.metric("Similar Buildings (Avg)", f"{similar_predictions.mean():.2f} units")
                 with col_c:
-                    st.metric("Dataset Average", f"{model.predict(X_train).mean():.2f} kWh")
+                    st.metric("Dataset Average", f"{model.predict(X_train).mean():.2f} units")
                 
                 plot_local_shap(model, explainer, X_train, instance, feature_names)
             
@@ -518,7 +520,7 @@ def main():
                 
                 # Overall distribution
                 axes[0, 0].hist(predictions, bins=30, edgecolor='black', alpha=0.7)
-                axes[0, 0].set_xlabel('Energy Load (kWh)')
+                axes[0, 0].set_xlabel('Energy Load (units)')
                 axes[0, 0].set_ylabel('Frequency')
                 axes[0, 0].set_title('Overall Prediction Distribution')
 
@@ -527,7 +529,7 @@ def main():
                     mask = X_train[feature_to_plot] == value
                     axes[0, 1].hist(predictions[mask], alpha=0.5, label=f'{feature_to_plot}={value}', bins=20)
 
-                axes[0, 1].set_xlabel('Energy Load (kWh)')
+                axes[0, 1].set_xlabel('Energy Load (units)')
                 axes[0, 1].set_ylabel('Frequency')
                 axes[0, 1].set_title(f'Distribution by {feature_to_plot}')
                 axes[0, 1].legend()
@@ -535,7 +537,7 @@ def main():
                 # Scatter: Actual features vs prediction
                 axes[1, 0].scatter(X_train[feature_to_plot], predictions, alpha=0.5)
                 axes[1, 0].set_xlabel(f'{feature_to_plot}')
-                axes[1, 0].set_ylabel('Predicted Energy Load (kWh)')
+                axes[1, 0].set_ylabel('Predicted Energy Load (units)')
                 axes[1, 0].set_title(f'{feature_to_plot} vs Energy Load')
 
                 axes[1, 1].axis('off')  # Empty plot
@@ -550,7 +552,7 @@ def main():
                 instance = pd.DataFrame([instance_data])
                 prediction = model.predict(instance)[0]
                 
-                st.metric("Predicted Energy Load", f"{prediction:.2f} kWh")
+                st.metric("Predicted Energy Load", f"{prediction:.2f} units")
                 
                 # Show feature contributions
                 plot_local_shap(model, explainer, X_train, instance, feature_names)

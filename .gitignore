@@ -1,2 +1,5 @@
 # Virtual Environments
 .venv/
+
+# Catboost specific files
+catboost_info/
