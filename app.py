@@ -64,6 +64,8 @@ if 'explainer' not in st.session_state:
     st.session_state.explainer = None
 if 'feature_names' not in st.session_state:
     st.session_state.feature_names = None
+if 'interaction_values' not in st.session_state:
+    st.session_state.interaction_values = None
 
 def set_global_seed():
     random.seed(GLOBAL_SEED)
@@ -93,8 +95,9 @@ def load_model_and_explainer():
     best_model.fit(X_train, y_train)
 
     explainer = shap.TreeExplainer(best_model)
+    interaction_values = explainer.shap_interaction_values(X_train)
 
-    return best_model, explainer, X_train, y_train
+    return best_model, explainer, X_train, y_train, interaction_values
 
 set_global_seed()
 
@@ -112,23 +115,24 @@ STAKEHOLDER_QUESTION_MAPPING = {
         "questions": [
             "What design features generally impact energy requirements the most?",
             "How does this feature tend to affect the total energy load?",
-            "What are the trade-offs between different design parameters?"
+            "How does the increase/decrease of features affect the total energy load?",
+            "Are there non-linear or interaction effects among the features?"
         ],
-        "explanation_type": ["global_shap", "feature_dependence", "interaction"]
+        "explanation_type": ["global_shap", "feature_dependence", "global_beeswarm", "interaction"]
     },
     "Energy Consultants": {
         "questions": [
             "Which features are making this design efficient/inefficient?",
-            "What changes can improve the efficiency of this building?",
-            "What is the expected energy load for this configuration?"
+            "What overall changes can improve the efficiency of this building?",
+            "If we cannot change some specific features, what can we change to optimize the energy efficiency?"
         ],
-        "explanation_type": ["local_shap", "counterfactual", "prediction"]
+        "explanation_type": ["local_shap", "counterfactual", "counterfactual_restrict"]
     },
     "Regulators": {
         "questions": [
             "Are the model decisions consistent and reliable?",
-            "What factors dominate energy efficiency predictions overall?",
-            "How do predictions vary across different building types?"
+            "How much do the factors contribute to energy efficiency predictions overall?",
+            "How do predictions vary across different building features?"
         ],
         "explanation_type": ["model_performance", "global_shap", "distribution"]
     }
@@ -162,7 +166,7 @@ def plot_feature_dependence(explainer, X_train, feature_names, feature):
     shap_values = explainer(X_train)
     
     fig, ax = plt.subplots(figsize=(10, 6))
-    shap.plots.scatter(shap_values[:, feature], color=shap_values, show=False)
+    shap.plots.scatter(shap_values[:, feature], color="#1E88E5", show=False)
     fig = plt.gcf() 
     st.pyplot(fig)
     plt.close(fig)
@@ -234,11 +238,19 @@ def generate_counterfactual_owners(model, instance, feature_names, features_to_f
         cf_df.index += 1
         st.write("**Possible Counterfactual Changes:**")
         st.dataframe(cf_df, use_container_width=True)
+        st.info("**Interpretation:** Shows how a feature with small changes (maximum 20%) can push the energy load to the desired range.")
     else:
         st.warning("No simple counterfactuals found. Try adjusting the desired range.")
 
-def generate_counterfactuals(model, X_train, y_train, instance, desired_range):
+def generate_counterfactuals(model, X_train, y_train, instance, desired_range, features=None):
+    current_prediction = model.predict(instance)[0]
+    
+    st.write(f"**Current Prediction:** {current_prediction:.2f} units")
+    st.write(f"**Desired Range:** {desired_range[0]:.2f} - {desired_range[1]:.2f} units")
+
     combined_df = pd.concat([X_train, y_train], axis=1)
+    if features is None or features == []:
+        features = X_train.columns.tolist()
 
     dice_data = dice_ml.Data(
         dataframe=combined_df,
@@ -252,19 +264,39 @@ def generate_counterfactuals(model, X_train, y_train, instance, desired_range):
     query_instance = instance.iloc[0:1]
 
     # Generate counterfactuals
-    counterfactual = dice_explainer.generate_counterfactuals(
-        query_instance,
-        total_CFs=5,
-        desired_range=desired_range
-    )
+    try:
+        counterfactual = dice_explainer.generate_counterfactuals(
+            query_instance,
+            total_CFs=5,
+            desired_range=desired_range,
+            features_to_vary=features
+        )
 
-    if counterfactual:
-        cf_df = counterfactual.cf_examples_list[0].final_cfs_df
-        cf_df.index += 1
-        st.write("**Possible Counterfactual Changes:**")
-        st.dataframe(cf_df, use_container_width=True)
+        if counterfactual:
+            cf_df = counterfactual.cf_examples_list[0].final_cfs_df
+            cf_df.index += 1
+            st.write("**Possible Counterfactual Changes:**")
+            st.dataframe(cf_df, use_container_width=True)
+            st.info("**Interpretation:** Shows alternative designs that can push the energy load within the desired range.")
+        else:
+            st.warning("No counterfactuals found for this range.")
+    except Exception as e:
+        st.warning("Could not generate counterfactuals for this configuration.")
+
+def plot_interaction(feature_one, feature_two, interaction_values, X_train):
+    if feature_one != feature_two:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        shap.dependence_plot(
+            (feature_one, feature_two),
+            interaction_values, 
+            X_train,
+            show=False
+        )
+        fig = plt.gcf() 
+        st.pyplot(fig)
+        plt.close(fig)
     else:
-        st.warning("No counterfactuals found for this range.")
+        st.warning("Please input two different features.")
 
 def main():
     st.markdown('<p class="main-header">Energy Efficiency - XAI Dashboard</p>', unsafe_allow_html=True)
@@ -282,17 +314,19 @@ def main():
     # Train model
     if st.session_state.model is None:
         with st.spinner("Training model..."):
-            model, explainer, X_train, y_train = load_model_and_explainer()
+            model, explainer, X_train, y_train, interaction_values = load_model_and_explainer()
             st.session_state.model = model
             st.session_state.explainer = explainer
             st.session_state.X_train = X_train
             st.session_state.y_train = y_train
             st.session_state.feature_names = feature_names
+            st.session_state.interaction_values = interaction_values
 
     model = st.session_state.model
     explainer = st.session_state.explainer
     X_train = st.session_state.X_train
     y_train = st.session_state.y_train
+    interaction_values = st.session_state.interaction_values
 
     st.success("Model loaded and ready!")
     st.markdown("---")
@@ -319,7 +353,7 @@ def main():
         st.markdown("---")
 
         # Create layout for inputs and visualization
-        needs_local = explanation_type in ["local_shap", "counterfactual", "local_comparison", "prediction"]
+        needs_local = explanation_type in ["local_shap", "counterfactual", "counterfactual_restrict", "local_comparison"]
         needs_counterfactual = explanation_type == "counterfactual"
         
         if needs_local or needs_counterfactual:
@@ -376,7 +410,6 @@ def main():
                 shap_values = explainer.shap_values(X_train)
                 
                 fig, ax = plt.subplots(figsize=(10, 8))
-                # shap.summary_plot(shap_values, X_train, feature_names=feature_names, plot_type="bar", show=False)
                 shap.plots.bar(shap.Explanation(
                     values=shap_values,
                     base_values=explainer.expected_value,
@@ -387,7 +420,7 @@ def main():
                 st.pyplot(fig)
                 plt.close()
                 
-                st.info("**Interpretation:** This shows the impact of each feature on model predictions across all samples.")
+                st.info("**Interpretation:** This shows the absolute impact of each feature on model predictions across all samples.")
                 
             elif explanation_type == "feature_dependence":
                 feature_of_interest = st.selectbox(
@@ -397,7 +430,7 @@ def main():
                 )
 
                 plot_feature_dependence(explainer, X_train, feature_names, feature_of_interest)
-                st.info(f"**Interpretation:** Shows how {feature_of_interest} affects energy load predictions. Color indicates interaction with other features.")
+                st.info(f"**Interpretation:** Shows how {feature_of_interest} affects energy load predictions.")
 
             elif explanation_type == "counterfactual":
                 st.markdown("### Counterfactual Settings")
@@ -459,7 +492,7 @@ def main():
                 
                 st.info("**Interpretation:** Left plot shows which features are most important globally. Right plot shows the distribution of model predictions.")
 
-            elif explanation_type == "interaction":
+            elif explanation_type == "global_beeswarm":
                 plot_global_shap(explainer, X_train, feature_names)
                 st.info("**Interpretation:** Shows how the increase and decrease of features affect the total energy load.")
             
@@ -505,8 +538,25 @@ def main():
                 with col_c:
                     st.metric("Dataset Average", f"{model.predict(X_train).mean():.2f} units")
                 
-                plot_local_shap(model, explainer, X_train, instance, feature_names)
-            
+                # plot_local_shap(model, explainer, X_train, instance, feature_names)
+                # Plot bar chart comparing predictions
+                labels = ['Your Building', 'Similar Buildings (Avg)', 'Dataset Average']
+                values = [
+                    prediction,
+                    similar_predictions.mean() if len(similar_predictions) > 0 else 0,
+                    model.predict(X_train).mean()
+                ]
+                
+                fig, ax = plt.subplots(figsize=(8, 4))
+                bars = ax.bar(labels, values, color=['blue', 'green', 'red'])
+                ax.set_ylabel('Energy Load (units)')
+                ax.set_title('Prediction Comparison')
+                plt.xticks(rotation=45)
+                st.pyplot(fig)
+                plt.close()
+
+                st.info("**Interpretation:** Compares the energy load of other buildings with similar features to that of your building.")
+
             elif explanation_type == "distribution":
                 predictions = model.predict(X_train)
 
@@ -547,15 +597,47 @@ def main():
                 plt.close()
                 
                 st.info("**Interpretation:** These plots show how predictions vary across a building characteristic.")
-            
-            elif explanation_type == "prediction":
+
+            elif explanation_type == "interaction":
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    feature_one = st.selectbox("Select first feature:", feature_names, index=0)
+                with col_b:
+                    feature_two = st.selectbox("Select second feature:", feature_names, index=1)
+                
+                plot_interaction(feature_one, feature_two, interaction_values, X_train)
+
+                st.info("**Interpretation:** Shows how a feature interacts with another feature, can reveal non-linear relationships.")
+
+            elif explanation_type == "counterfactual_restrict":
+                st.markdown("### Counterfactual Settings")
+
+                features_to_change = st.multiselect(
+                    "Change these features:",
+                    options=feature_names,
+                    default=feature_names[:2]
+                )
+
+                current_pred = model.predict(pd.DataFrame([instance_data]))[0]
+
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    min_desired = st.number_input(
+                        "Min desired load:",
+                        value=max(0.0, current_pred - 10),
+                        step=1.0
+                    )
+                with col_b:
+                    max_desired = st.number_input(
+                        "Max desired load:",
+                        value=current_pred - 5,
+                        step=1.0
+                    )
+                desired_range = (min_desired, max_desired)
+
                 instance = pd.DataFrame([instance_data])
-                prediction = model.predict(instance)[0]
-                
-                st.metric("Predicted Energy Load", f"{prediction:.2f} units")
-                
-                # Show feature contributions
-                plot_local_shap(model, explainer, X_train, instance, feature_names)
+
+                generate_counterfactuals(model, X_train, y_train, instance, desired_range, features_to_change)
 
     # Footer
     st.markdown("---")
