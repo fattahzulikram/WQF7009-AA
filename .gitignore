@@ -3,3 +3,6 @@
 
 # Catboost specific files
 catboost_info/
+
+# Submission files
+Final Submission/
