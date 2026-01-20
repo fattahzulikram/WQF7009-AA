@@ -23,7 +23,7 @@ DATA_FILE = "clean_data.csv"
 INPUT_PATH  = os.path.join(DATA_DIR, DATA_FILE)
 
 GLOBAL_SEED = 63
-categorical_features = ['Orientation', 'Glazing Area', 'Glazing Area Distribution']
+categorical_features = ['Orientation', 'Glazing Area Distribution']
 
 # Page configuration
 st.set_page_config(page_title="Energy Efficiency XAI Dashboard", layout="wide")
@@ -138,21 +138,34 @@ STAKEHOLDER_QUESTION_MAPPING = {
     }
 }
 
-def plot_local_shap(model, explainer, X_train, instance, feature_names):
+def plot_local_shap(explainer, instance, feature_names, role="Building Owners"):
     shap_values = explainer.shap_values(instance)
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
-    shap.plots.waterfall(
-        shap.Explanation(
-            values=shap_values[0],
-            base_values=explainer.expected_value,
-            data=instance.values[0],
-            feature_names=feature_names
-        ),
-        show=False
-    )
-    st.pyplot(fig)
-    plt.close()
+
+    if role == "Building Owners":
+        fig, ax = plt.subplots(figsize=(10, 6))
+        shap.plots.force(
+            explainer.expected_value,
+            shap_values[0], 
+            feature_names=feature_names, 
+            show=False, 
+            matplotlib=True
+        )
+        fig = plt.gcf() 
+        st.pyplot(fig)
+        plt.close()
+    else:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        shap.plots.waterfall(
+            shap.Explanation(
+                values=shap_values[0],
+                base_values=explainer.expected_value,
+                data=instance.values[0],
+                feature_names=feature_names
+            ),
+            show=False
+        )
+        st.pyplot(fig)
+        plt.close()
 
 def plot_global_shap(explainer, X_train, feature_names):
     shap_values = explainer.shap_values(X_train)
@@ -402,7 +415,7 @@ def main():
                 instance = pd.DataFrame([instance_data])
                 prediction = model.predict(instance)[0]
                 st.metric("Predicted Energy Load", f"{prediction:.2f} units")
-                plot_local_shap(model, explainer, X_train, instance, feature_names)
+                plot_local_shap(explainer, instance, feature_names, selected_role)
                 
                 st.info("**Interpretation:** Red bars push the prediction higher, blue bars push it lower. Longer bars indicate stronger effects.")
 
